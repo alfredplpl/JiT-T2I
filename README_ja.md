@@ -23,8 +23,8 @@
 ### 1. 基本環境のセットアップ
 
 ```bash
-git clone https://github.com/LTH14/JiT.git
-cd JiT
+git clone https://github.com/alfredplpl/JiT-T2I.git
+cd JiT-T2I
 conda env create -f environment.yaml
 conda activate jit
 ```
