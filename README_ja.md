@@ -346,4 +346,4 @@ tensorboard --logdir ./output_jit_text_256
 
 ## 📧 コンタクト
 
-質問やバグ報告は、[GitHub Issues](https://github.com/LTH14/JiT/issues)へお願いします。
+質問やバグ報告は、[GitHub Issues](https://github.com/alfredplpl/JiT-T2I/issues)へお願いします。
