@@ -25,17 +25,30 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    use_text = args.use_text_conditioning if hasattr(args, 'use_text_conditioning') else False
+
+    for data_iter_step, batch_data in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         # per iteration (instead of per epoch) lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+
+        # Unpack batch data based on conditioning type
+        if use_text:
+            x, input_ids, attention_mask = batch_data
+            input_ids = input_ids.to(device, non_blocking=True)
+            attention_mask = attention_mask.to(device, non_blocking=True)
+        else:
+            x, labels = batch_data
+            labels = labels.to(device, non_blocking=True)
 
         # normalize image to [-1, 1]
         x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
         x = x * 2.0 - 1.0
-        labels = labels.to(device, non_blocking=True)
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            loss = model(x, labels)
+            if use_text:
+                loss = model(x, input_ids=input_ids, attention_mask=attention_mask)
+            else:
+                loss = model(x, labels)
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -64,12 +77,14 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
                 log_writer.add_scalar('lr', lr, epoch_1000x)
 
 
-def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
+def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None, tokenizer=None):
 
     model_without_ddp.eval()
     world_size = misc.get_world_size()
     local_rank = misc.get_rank()
     num_steps = args.num_images // (batch_size * world_size) + 1
+
+    use_text = args.use_text_conditioning if hasattr(args, 'use_text_conditioning') else False
 
     # Construct the folder name for saving generated images.
     save_folder = os.path.join(
@@ -93,22 +108,48 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     print("Switch to ema")
     model_without_ddp.load_state_dict(ema_state_dict)
 
-    # ensure that the number of images per class is equal.
-    class_num = args.class_num
-    assert args.num_images % class_num == 0, "Number of images per class must be the same"
-    class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
-    class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
+    if use_text:
+        # For text conditioning, use a diverse set of test prompts
+        # You can customize this list for your specific use case
+        test_prompts = [
+            "猫の写真", "犬の写真", "風景の写真", "建物の写真", "花の写真",
+            "車の写真", "鳥の写真", "食べ物の写真", "人物の写真", "動物の写真"
+        ] * 100  # Repeat to have enough prompts
+    else:
+        # ensure that the number of images per class is equal.
+        class_num = args.class_num
+        assert args.num_images % class_num == 0, "Number of images per class must be the same"
+        class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
+        class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
 
     for i in range(num_steps):
         print("Generation step {}/{}".format(i, num_steps))
 
         start_idx = world_size * batch_size * i + local_rank * batch_size
         end_idx = start_idx + batch_size
-        labels_gen = class_label_gen_world[start_idx:end_idx]
-        labels_gen = torch.Tensor(labels_gen).long().cuda()
 
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            sampled_images = model_without_ddp.generate(labels_gen)
+        if use_text:
+            # Get batch of prompts
+            batch_prompts = test_prompts[start_idx:end_idx]
+            # Tokenize
+            tokens = tokenizer(
+                batch_prompts,
+                padding='max_length',
+                truncation=True,
+                max_length=args.max_text_len if hasattr(args, 'max_text_len') else 77,
+                return_tensors='pt'
+            )
+            input_ids = tokens['input_ids'].cuda()
+            attention_mask = tokens['attention_mask'].cuda()
+
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                sampled_images = model_without_ddp.generate(input_ids=input_ids, attention_mask=attention_mask)
+        else:
+            labels_gen = class_label_gen_world[start_idx:end_idx]
+            labels_gen = torch.Tensor(labels_gen).long().cuda()
+
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                sampled_images = model_without_ddp.generate(labels_gen)
 
         torch.distributed.barrier()
 

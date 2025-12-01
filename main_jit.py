@@ -18,6 +18,8 @@ import copy
 from engine_jit import train_one_epoch, evaluate
 
 from denoiser import Denoiser
+from transformers import AutoTokenizer
+from text_image_dataset import TextImageDataset, ImageNetWithCaptions
 
 
 def get_args_parser():
@@ -29,6 +31,16 @@ def get_args_parser():
     parser.add_argument('--img_size', default=256, type=int, help='Image size')
     parser.add_argument('--attn_dropout', type=float, default=0.0, help='Attention dropout rate')
     parser.add_argument('--proj_dropout', type=float, default=0.0, help='Projection dropout rate')
+
+    # text conditioning
+    parser.add_argument('--use_text_conditioning', action='store_true',
+                        help='Use text conditioning instead of class labels')
+    parser.add_argument('--llm_model_name', default='llm-jp/llm-jp-3-3.7b', type=str,
+                        help='LLM model name for text conditioning')
+    parser.add_argument('--freeze_llm', action='store_true', default=True,
+                        help='Freeze LLM weights during training')
+    parser.add_argument('--max_text_len', default=77, type=int,
+                        help='Maximum text sequence length')
 
     # training
     parser.add_argument('--epochs', default=200, type=int)
@@ -129,6 +141,15 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
+    # Initialize tokenizer for text conditioning
+    tokenizer = None
+    if args.use_text_conditioning or '-Text' in args.model:
+        print(f"Loading tokenizer: {args.llm_model_name}")
+        tokenizer = AutoTokenizer.from_pretrained(args.llm_model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        args.use_text_conditioning = True
+
     # Set up TensorBoard logging (only on main process)
     if global_rank == 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -143,7 +164,17 @@ def main(args):
         transforms.PILToTensor()
     ])
 
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+    # Create dataset
+    if args.use_text_conditioning:
+        print("Using text conditioning with custom captions")
+        dataset_train = TextImageDataset(
+            data_path=args.data_path,
+            transform=transform_train,
+            tokenizer=tokenizer,
+            max_text_len=args.max_text_len
+        )
+    else:
+        dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     print(dataset_train)
 
     sampler_train = torch.utils.data.DistributedSampler(
@@ -215,7 +246,7 @@ def main(args):
         with torch.random.fork_rng():
             torch.manual_seed(seed)
             with torch.no_grad():
-                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer, tokenizer=tokenizer)
         return
 
     # Training loop
@@ -249,7 +280,7 @@ def main(args):
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             with torch.no_grad():
-                evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer, tokenizer=tokenizer)
             torch.cuda.empty_cache()
 
         if misc.is_main_process() and log_writer is not None:

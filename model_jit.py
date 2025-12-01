@@ -8,6 +8,7 @@ import torch.nn as nn
 import math
 import torch.nn.functional as F
 from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
+from transformers import AutoModel, AutoTokenizer
 
 
 def modulate(x, shift, scale):
@@ -89,6 +90,50 @@ class LabelEmbedder(nn.Module):
     def forward(self, labels):
         embeddings = self.embedding_table(labels)
         return embeddings
+
+
+class LLMTextEncoder(nn.Module):
+    """
+    Encodes text using a pretrained LLM (e.g., llm-jp) and projects to hidden_size.
+    LLM weights are frozen during training.
+    """
+    def __init__(self, llm_model_name, hidden_size, freeze_llm=True):
+        super().__init__()
+        # Load pretrained LLM
+        self.llm = AutoModel.from_pretrained(llm_model_name)
+        llm_hidden_size = self.llm.config.hidden_size
+
+        # Freeze LLM weights
+        if freeze_llm:
+            for param in self.llm.parameters():
+                param.requires_grad = False
+
+        # Projection layer to match JiT hidden_size
+        self.projection = nn.Linear(llm_hidden_size, hidden_size)
+
+    def forward(self, input_ids, attention_mask):
+        """
+        Args:
+            input_ids: (B, seq_len) tokenized text
+            attention_mask: (B, seq_len) attention mask
+        Returns:
+            text_embeddings: (B, hidden_size) pooled text embeddings
+        """
+        with torch.no_grad() if not self.training else torch.enable_grad():
+            outputs = self.llm(input_ids=input_ids, attention_mask=attention_mask)
+
+        # Mean pooling over sequence length
+        last_hidden_state = outputs.last_hidden_state  # (B, seq_len, llm_hidden_size)
+
+        # Masked mean pooling (ignore padding tokens)
+        mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+        sum_embeddings = torch.sum(last_hidden_state * mask_expanded, dim=1)
+        sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
+        pooled = sum_embeddings / sum_mask  # (B, llm_hidden_size)
+
+        # Project to JiT hidden_size
+        projected = self.projection(pooled)  # (B, hidden_size)
+        return projected
 
 
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
@@ -220,7 +265,10 @@ class JiT(nn.Module):
         num_classes=1000,
         bottleneck_dim=128,
         in_context_len=32,
-        in_context_start=8
+        in_context_start=8,
+        use_text_conditioning=False,
+        llm_model_name=None,
+        freeze_llm=True
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -232,10 +280,15 @@ class JiT(nn.Module):
         self.in_context_len = in_context_len
         self.in_context_start = in_context_start
         self.num_classes = num_classes
+        self.use_text_conditioning = use_text_conditioning
 
-        # time and class embed
+        # time and class/text embed
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size)
+        if use_text_conditioning:
+            assert llm_model_name is not None, "llm_model_name must be provided when use_text_conditioning=True"
+            self.y_embedder = LLMTextEncoder(llm_model_name, hidden_size, freeze_llm=freeze_llm)
+        else:
+            self.y_embedder = LabelEmbedder(num_classes, hidden_size)
 
         # linear embed
         self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True)
@@ -328,15 +381,23 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y=None, input_ids=None, attention_mask=None):
         """
         x: (N, C, H, W)
         t: (N,)
-        y: (N,)
+        y: (N,) for class conditioning
+        input_ids: (N, seq_len) for text conditioning
+        attention_mask: (N, seq_len) for text conditioning
         """
-        # class and time embeddings
+        # class/text and time embeddings
         t_emb = self.t_embedder(t)
-        y_emb = self.y_embedder(y)
+        if self.use_text_conditioning:
+            assert input_ids is not None and attention_mask is not None, \
+                "input_ids and attention_mask required for text conditioning"
+            y_emb = self.y_embedder(input_ids, attention_mask)
+        else:
+            assert y is not None, "y (class labels) required for class conditioning"
+            y_emb = self.y_embedder(y)
         c = t_emb + y_emb
 
         # forward JiT
@@ -384,6 +445,43 @@ def JiT_H_32(**kwargs):
                bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=32, **kwargs)
 
 
+def JiT_B_16_Text(**kwargs):
+    """JiT-B/16 with text conditioning via LLM"""
+    return JiT(depth=12, hidden_size=768, num_heads=12,
+               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=16,
+               use_text_conditioning=True, **kwargs)
+
+def JiT_B_32_Text(**kwargs):
+    """JiT-B/32 with text conditioning via LLM"""
+    return JiT(depth=12, hidden_size=768, num_heads=12,
+               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=32,
+               use_text_conditioning=True, **kwargs)
+
+def JiT_L_16_Text(**kwargs):
+    """JiT-L/16 with text conditioning via LLM"""
+    return JiT(depth=24, hidden_size=1024, num_heads=16,
+               bottleneck_dim=128, in_context_len=32, in_context_start=8, patch_size=16,
+               use_text_conditioning=True, **kwargs)
+
+def JiT_L_32_Text(**kwargs):
+    """JiT-L/32 with text conditioning via LLM"""
+    return JiT(depth=24, hidden_size=1024, num_heads=16,
+               bottleneck_dim=128, in_context_len=32, in_context_start=8, patch_size=32,
+               use_text_conditioning=True, **kwargs)
+
+def JiT_H_16_Text(**kwargs):
+    """JiT-H/16 with text conditioning via LLM"""
+    return JiT(depth=32, hidden_size=1280, num_heads=16,
+               bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=16,
+               use_text_conditioning=True, **kwargs)
+
+def JiT_H_32_Text(**kwargs):
+    """JiT-H/32 with text conditioning via LLM"""
+    return JiT(depth=32, hidden_size=1280, num_heads=16,
+               bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=32,
+               use_text_conditioning=True, **kwargs)
+
+
 JiT_models = {
     'JiT-B/16': JiT_B_16,
     'JiT-B/32': JiT_B_32,
@@ -391,4 +489,10 @@ JiT_models = {
     'JiT-L/32': JiT_L_32,
     'JiT-H/16': JiT_H_16,
     'JiT-H/32': JiT_H_32,
+    'JiT-B/16-Text': JiT_B_16_Text,
+    'JiT-B/32-Text': JiT_B_32_Text,
+    'JiT-L/16-Text': JiT_L_16_Text,
+    'JiT-L/32-Text': JiT_L_32_Text,
+    'JiT-H/16-Text': JiT_H_16_Text,
+    'JiT-H/32-Text': JiT_H_32_Text,
 }
